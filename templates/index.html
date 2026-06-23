@@ -102,7 +102,7 @@
 <body>
 
 <div class="container">
-    <h1>Tajweedddd</h1>
+    <h1>Tajweed</h1>
     <p class="subtitle">Deteksi Kesalahan Bacaan Tajwid</p>
 
     <!-- Upload -->
@@ -120,11 +120,7 @@
 
     <!-- Actions -->
     <div class="actions">
-        <select id="methodSelect" style="padding:9px 12px; border:1px solid #ddd; border-radius:6px; font-size:0.9em; background:#fff;">
-            <option value="whisper">Whisper</option>
-            <option value="energy">Energy VAD</option>
-            <option value="sliding">Sliding Window</option>
-        </select>
+        <!-- Method selection removed: Model A uses Energy VAD, Model B uses Sliding Window -->
         <button class="btn btn-primary" id="btnAnalyze" disabled>Analisis Otomatis</button>
         <button class="btn btn-secondary" id="btnClear" style="display:none;">Reset</button>
     </div>
@@ -169,7 +165,7 @@ const fileInput   = document.getElementById('fileInput');
 const fileName    = document.getElementById('fileName');
 const btnAnalyze  = document.getElementById('btnAnalyze');
 const btnClear    = document.getElementById('btnClear');
-const methodSel   = document.getElementById('methodSelect');
+// No method selection: fixed pipeline (Model A -> Energy, Model B -> Sliding)
 const loading     = document.getElementById('loading');
 const errorMsg    = document.getElementById('errorMsg');
 const results     = document.getElementById('results');
@@ -274,7 +270,6 @@ btnAnalyze.addEventListener('click', async () => {
 
     const formData = new FormData();
     formData.append('audio', currentFile);
-    formData.append('method', methodSel.value);
 
     try {
         const resp = await fetch('/api/analyze', {
@@ -299,12 +294,13 @@ btnAnalyze.addEventListener('click', async () => {
 });
 
 function showResults(data) {
-    const modelACnt = data.segments.filter(s => s.model === 'A').length;
-    const modelBCnt = data.segments.filter(s => s.model === 'B').length;
+    const segmentsA = Array.isArray(data.segments_a) ? data.segments_a : [];
+    const segmentsB = Array.isArray(data.segments_b) ? data.segments_b : [];
+    const totalSegments = (data.num_segments_a || 0) + (data.num_segments_b || 0);
 
     summary.innerHTML = `
         <div class="stat">
-            <div class="stat-value">${data.num_segments}</div>
+            <div class="stat-value">${totalSegments}</div>
             <div class="stat-label">Total Segmen</div>
         </div>
         <div class="stat">
@@ -312,20 +308,24 @@ function showResults(data) {
             <div class="stat-label">Durasi Audio</div>
         </div>
         <div class="stat">
-            <div class="stat-value">${modelACnt}</div>
+            <div class="stat-value">${data.num_segments_a || 0}</div>
             <div class="stat-label">Qalqalah / Mad</div>
         </div>
         <div class="stat">
-            <div class="stat-value">${modelBCnt}</div>
+            <div class="stat-value">${data.num_segments_b || 0}</div>
             <div class="stat-label">Nun Sukun / Tanwin</div>
         </div>
     `;
 
-const mLabel = data.method === 'whisper' ? 'Whisper' :
-                   data.method === 'sliding' ? 'Sliding' : 'Energy VAD';    document.getElementById('methodInfo').textContent = 'Metode segmentasi: ' + mLabel;
+    document.getElementById('methodInfo').textContent = 'Metode: Model A = Energy VAD; Model B = Sliding Window';
+
+    // Combine segments for display (preserve model tag)
+    const combined = [];
+    segmentsA.forEach(s => combined.push(s));
+    segmentsB.forEach(s => combined.push(s));
 
     segTable.innerHTML = '';
-    data.segments.forEach(seg => {
+    combined.forEach((seg, idx) => {
         const badgeClass = seg.model === 'A' ? 'badge-a' :
                            seg.model === 'B' ? 'badge-b' : 'badge-none';
         const badgeText  = seg.model === 'A' ? 'Qalqalah/Mad' :
@@ -335,7 +335,7 @@ const mLabel = data.method === 'whisper' ? 'Whisper' :
 
         segTable.innerHTML += `
             <tr>
-                <td>${seg.index}</td>
+                <td>${idx + 1}</td>
                 <td>${seg.start}s — ${seg.end}s</td>
                 <td style="font-family:'Traditional Arabic','Amiri',serif; font-size:1.2em; direction:rtl;">${textAr}</td>
                 <td>${seg.duration}s</td>
@@ -350,7 +350,7 @@ const mLabel = data.method === 'whisper' ? 'Whisper' :
         `;
     });
 
-    drawSegmentsOnWaveform(data.segments, data.total_duration);
+    drawSegmentsOnWaveform(combined, data.total_duration);
 
     results.style.display = 'block';
 }

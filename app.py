@@ -42,6 +42,11 @@ MIN_CONF_B = 0
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 DEBUG_PREDICT = True
+# Labels to suppress in API responses
+SUPPRESS_LABELS = set([
+    'correct', 'Qalqalah_Benar', 'Mad_Thabii_Benar',
+    'Mad_Wajib_Benar', 'Mad_Lazim_Benar',
+])
 
 
 # Model A  - transformer
@@ -133,6 +138,11 @@ class KerasModelWrapper:
     def __call__(self, x):
         # x: torch tensor shape (batch, length) on device
         x_cpu = x.detach().cpu()
+        if DEBUG_PREDICT:
+            try:
+                print(f'KerasModelWrapper.__call__: x_cpu.shape={getattr(x_cpu, "shape", None)} dtype={getattr(x_cpu, "dtype", None)}')
+            except Exception:
+                pass
         # Prefer PNCC input for the Keras model. Convert each waveform in the
         # batch to PNCC (n_pncc x time) and present as (batch, time, features).
         try:
@@ -147,16 +157,29 @@ class KerasModelWrapper:
                 batch_feats.append(pncc.T)
 
             feat_np = np.stack(batch_feats).astype('float32')  # (b, time, features)
+            if DEBUG_PREDICT:
+                try:
+                    print('KerasModelWrapper: PNCC feat_np.shape=', feat_np.shape)
+                    print('KerasModelWrapper: PNCC sample mean/std=', np.mean(feat_np), np.std(feat_np))
+                except Exception:
+                    pass
 
             preds = self.model.predict(feat_np, verbose=0)
         except Exception as e:
             # Fallback to mel-based approach if PNCC extraction or model
             # prediction fails for compatibility with older models.
             try:
+                if DEBUG_PREDICT:
+                    print('KerasModelWrapper: PNCC path failed, falling back to mel. Exception:', repr(e))
                 with torch.no_grad():
                     mel = self.mel(x_cpu).unsqueeze(1)  # (b,1,n_mels,t)
                 mel_np = mel.numpy().astype('float32')
                 mel_np = np.transpose(mel_np, (0,2,3,1))
+                if DEBUG_PREDICT:
+                    try:
+                        print('KerasModelWrapper: mel_np.shape=', mel_np.shape, 'mel mean/std=', np.mean(mel_np), np.std(mel_np))
+                    except Exception:
+                        pass
                 preds = self.model.predict(mel_np, verbose=0)
             except Exception:
                 raise e
@@ -164,10 +187,21 @@ class KerasModelWrapper:
         # Convert to numpy then torch tensor on the target device.
         preds_arr = np.array(preds)
         # Detect if model returned probabilities (rows sum ~ 1)
-        if preds_arr.ndim == 2 and np.allclose(preds_arr.sum(axis=1), 1.0, atol=1e-3):
+        try:
+            sums = preds_arr.sum(axis=1) if preds_arr.ndim == 2 else None
+        except Exception:
+            sums = None
+        if preds_arr.ndim == 2 and sums is not None and np.allclose(sums, 1.0, atol=1e-3):
             self.returns_probabilities = True
         else:
             self.returns_probabilities = False
+        if DEBUG_PREDICT:
+            try:
+                print('KerasModelWrapper: preds_arr.shape=', preds_arr.shape, 'returns_probabilities=', self.returns_probabilities)
+                if preds_arr.ndim == 2:
+                    print('KerasModelWrapper: preds_arr[0][:5]=', preds_arr[0][:5])
+            except Exception:
+                pass
 
         logits = torch.from_numpy(preds_arr).to(device)
         return logits
@@ -504,6 +538,102 @@ def energy_score(logits, temperature=1.0):
     return -temperature * torch.logsumexp(logits / temperature, dim=1).item()
 
 
+def predict_segment_a(audio_np, sr, model_a):
+    """Predict using Model A only (energy VAD pipeline).
+
+    Returns a simplified dict similar to `predict_segment` but always
+    selects Model A outputs (Qalqalah / Mad labels).
+    """
+    # Accept either a raw waveform numpy array or a segment dict
+    if isinstance(audio_np, dict):
+        # prefer the raw audio chunk stored under 'audio'
+        arr = audio_np.get('audio')
+        if arr is None:
+            # fallback: maybe caller passed pncc-only dict; use empty waveform
+            arr = np.zeros(1, dtype='float32')
+        tensor = preprocess_segment(arr, sr)
+    else:
+        tensor = preprocess_segment(audio_np, sr)
+
+    with torch.no_grad():
+        logits_a = model_a(tensor)
+        prob_a = F.softmax(logits_a, dim=1)[0]
+        pred_a = prob_a.argmax().item()
+        conf_a = prob_a.max().item()
+        e_a = energy_score(logits_a)
+
+    return {
+        'model': 'A',
+        'domain': 'Qalqalah / Mad',
+        'label': LABELS_A[pred_a],
+        'confidence': round(conf_a * 100, 1),
+        'energy': round(e_a, 2),
+        'probs': [round(float(x) * 100, 2) for x in (prob_a.detach().cpu().numpy() if isinstance(prob_a, torch.Tensor) else np.array(prob_a))],
+    }
+
+
+def predict_segment_b(audio_np, sr, model_b):
+    """Predict using Model B only (sliding-window / PNCC pipeline).
+
+    Accepts either raw audio or a dict with precomputed `pncc`.
+    """
+    # If caller supplied precomputed PNCC (sliding window), prefer it.
+    use_pncc = isinstance(audio_np, dict) and 'pncc' in audio_np
+
+    if use_pncc:
+        pncc = audio_np['pncc']
+        # PNCC -> (time, features) as (1, time, features)
+        feat = pncc.T[np.newaxis, ...].astype('float32')
+        try:
+            if DEBUG_PREDICT:
+                try:
+                    print('predict_segment_b: Using PNCC precomputed, feat.shape=', feat.shape)
+                    print('predict_segment_b: PNCC sample mean/std=', np.mean(pncc), np.std(pncc))
+                except Exception:
+                    pass
+            preds = model_b.model.predict(feat, verbose=0)
+            logits_b_raw = torch.from_numpy(np.array(preds)).to(device)
+            if logits_b_raw.ndim == 2 and np.allclose(logits_b_raw.cpu().numpy().sum(axis=1), 1.0, atol=1e-3):
+                model_b.returns_probabilities = True
+            else:
+                model_b.returns_probabilities = False
+        except Exception:
+            # fallback to standard wrapper call which computes mel/PNCC internally
+            if DEBUG_PREDICT:
+                print('predict_segment_b: model_b.model.predict(feat) failed, falling back to wrapper', repr(traceback.format_exc()))
+            logits_b_raw = model_b(preprocess_segment(audio_np.get('audio', np.zeros(1)), sr) if isinstance(audio_np, dict) else preprocess_segment(audio_np, sr))
+    else:
+        logits_b_raw = model_b(preprocess_segment(audio_np, sr))
+
+    if getattr(model_b, 'returns_probabilities', False):
+        prob_b = logits_b_raw[0]
+        pred_b = prob_b.argmax().item()
+        conf_b = prob_b.max().item()
+        logits_b_for_energy = torch.log(torch.clamp(logits_b_raw, min=1e-9))
+        e_b = energy_score(logits_b_for_energy)
+    else:
+        prob_b = F.softmax(logits_b_raw, dim=1)[0]
+        pred_b = prob_b.argmax().item()
+        conf_b = prob_b.max().item()
+        e_b = energy_score(logits_b_raw)
+
+    if DEBUG_PREDICT:
+        try:
+            print('predict_segment_b: returns_probabilities=', getattr(model_b, 'returns_probabilities', None))
+            print('predict_segment_b: pred_b, conf_b, probs=', pred_b, conf_b, (prob_b.detach().cpu().numpy() if isinstance(prob_b, torch.Tensor) else np.array(prob_b)).tolist()[:6])
+        except Exception:
+            pass
+
+    return {
+        'model': 'B',
+        'domain': 'Nun Sukun / Tanwin',
+        'label': LABELS_B[pred_b],
+        'confidence': round(conf_b * 100, 1),
+        'energy': round(e_b, 2),
+        'probs': [round(float(x) * 100, 2) for x in (prob_b.detach().cpu().numpy() if isinstance(prob_b, torch.Tensor) else np.array(prob_b))],
+    }
+
+
 def predict_segment(audio_np, sr, model_a, model_b):
     # If caller passed PNCC directly (from sliding window), accept it.
     if isinstance(audio_np, dict) and 'pncc' in audio_np:
@@ -670,9 +800,6 @@ def index():
 def analyze():
     if 'audio' not in request.files:
         return jsonify({'error': 'Tidak ada file audio'}), 400
-
-    method = request.form.get('method', 'whisper')  # whisper atau energy
-
     audio_file = request.files['audio']
     tmp = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
     audio_file.save(tmp.name)
@@ -683,41 +810,19 @@ def analyze():
         if audio_np.ndim > 1:
             audio_np = audio_np.mean(axis=1)
         total_duration = len(audio_np) / sr
+        # New pipeline split: Model A uses energy VAD; Model B uses sliding window.
+        segments_a = segment_with_energy(audio_np, sr)
+        segments_b = segment_with_sliding_window(audio_np, sr)
 
-        # Segmentasi
-        segments = []
-        used_method = method
-
-        if method == 'whisper':
-            try:
-                segments = segment_with_whisper(tmp.name)
-                used_method = 'whisper'
-            except Exception as e:
-                print(f'Whisper gagal: {e}, kembali ke Energy VAD')
-                segments = segment_with_energy(audio_np, sr)
-                used_method = 'energy'
-        elif method == 'sliding':
-            segments = segment_with_sliding_window(audio_np, sr)
-            used_method = 'sliding'
-        else:
-            segments = segment_with_energy(audio_np, sr)
-            used_method = 'energy'
-
-        if not segments:
-            return jsonify({
-                'total_duration': round(total_duration, 2),
-                'num_segments': 0,
-                'method': used_method,
-                'segments': [],
-                'message': 'Tidak ditemukan segmen speech.'
-            })
-
-        # Prediksi per segmen
-        results = []
-        for i, seg in enumerate(segments):
-            # Pass the full segment so predict_segment can use precomputed PNCC
-            pred = predict_segment(seg, TARGET_SR, model_a, model_b)
-            results.append({
+        results_a = []
+        for i, seg in enumerate(segments_a):
+            pred = predict_segment_a(seg, TARGET_SR, model_a)
+            # Suppress unwanted labels
+            if pred.get('label') in SUPPRESS_LABELS:
+                if DEBUG_PREDICT:
+                    print(f"Suppressing Model A label: {pred.get('label')}")
+                continue
+            results_a.append({
                 'index': i + 1,
                 'start': seg['start'],
                 'end': seg['end'],
@@ -727,11 +832,40 @@ def analyze():
                 **pred,
             })
 
+        results_b = []
+        for i, seg in enumerate(segments_b):
+            pred = predict_segment_b(seg, TARGET_SR, model_b)
+            # Suppress unwanted labels
+            if pred.get('label') in SUPPRESS_LABELS:
+                if DEBUG_PREDICT:
+                    print(f"Suppressing Model B label: {pred.get('label')}")
+                continue
+            results_b.append({
+                'index': i + 1,
+                'start': seg['start'],
+                'end': seg['end'],
+                'duration': seg['duration'],
+                'text': seg.get('text', ''),
+                'audio_b64': segment_to_base64(seg['audio'], TARGET_SR),
+                **pred,
+            })
+
+        if not results_a and not results_b:
+            return jsonify({
+                'total_duration': round(total_duration, 2),
+                'num_segments_a': 0,
+                'num_segments_b': 0,
+                'segments_a': [],
+                'segments_b': [],
+                'message': 'Tidak ditemukan segmen speech untuk kedua pipeline.'
+            })
+
         return jsonify({
             'total_duration': round(total_duration, 2),
-            'num_segments': len(results),
-            'method': used_method,
-            'segments': results,
+            'num_segments_a': len(results_a),
+            'num_segments_b': len(results_b),
+            'segments_a': results_a,
+            'segments_b': results_b,
         })
 
     except Exception as e:
