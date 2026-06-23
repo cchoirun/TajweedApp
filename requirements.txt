@@ -1,0 +1,10 @@
+flask
+torch
+torchaudio
+transformers
+soundfile
+numpy
+scipy
+openai-whisper
+torchcodec
+librosa

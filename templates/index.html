@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Deteksi Tajwid</title>
+    <style>
+        * { margin:0; padding:0; box-sizing:border-box; }
+        body { font-family:'Segoe UI',sans-serif; background:#f5f5f5; color:#333; }
+
+        .container { max-width:900px; margin:0 auto; padding:20px; }
+
+        h1 { text-align:center; margin:20px 0 5px; font-size:1.8em; }
+        .subtitle { text-align:center; color:#777; margin-bottom:30px; font-size:0.9em; }
+
+        
+        .upload-area {
+            border:2px dashed #ccc; border-radius:8px; padding:40px;
+            text-align:center; cursor:pointer; background:#fff;
+            transition: border-color 0.2s;
+        }
+        .upload-area:hover { border-color:#2196F3; }
+        .upload-area.dragover { border-color:#2196F3; background:#e3f2fd; }
+        .upload-area input { display:none; }
+        .upload-area p { color:#999; }
+        .upload-area .filename { color:#333; font-weight:bold; margin-top:8px; }
+
+        /* Pertombolan */
+        .btn {
+            padding:10px 24px; border:none; border-radius:6px;
+            cursor:pointer; font-size:0.95em; transition:opacity 0.2s;
+        }
+        .btn:hover { opacity:0.85; }
+        .btn-primary { background:#2196F3; color:#fff; }
+        .btn-secondary { background:#eee; color:#333; }
+        .btn:disabled { opacity:0.4; cursor:not-allowed; }
+
+        .actions { text-align:center; margin:20px 0; }
+        .actions .btn { margin:0 5px; }
+
+        /* Waveform */
+        .waveform-container {
+            background:#fff; border-radius:8px; padding:15px;
+            margin:20px 0; display:none;
+        }
+        canvas { width:100%; height:120px; display:block; cursor:crosshair; }
+
+        /* Audio player */
+        audio { width:100%; margin:10px 0; }
+
+        /* Results */
+        .results { margin:20px 0; display:none; }
+        .results h2 { margin-bottom:15px; font-size:1.2em; }
+        .summary {
+            background:#fff; border-radius:8px; padding:15px;
+            margin-bottom:15px; display:flex; gap:20px; flex-wrap:wrap;
+        }
+        .summary .stat { flex:1; min-width:120px; text-align:center; }
+        .summary .stat-value { font-size:1.5em; font-weight:bold; }
+        .summary .stat-label { font-size:0.8em; color:#777; }
+
+        
+        table { width:100%; border-collapse:collapse; background:#fff; border-radius:8px; overflow:hidden; }
+        th { background:#f0f0f0; padding:10px 12px; text-align:left; font-size:0.85em; }
+        td { padding:10px 12px; border-top:1px solid #eee; font-size:0.9em; vertical-align:middle; }
+
+        .badge {
+            display:inline-block; padding:3px 10px; border-radius:12px;
+            font-size:0.8em; font-weight:bold; color:#fff;
+        }
+        .badge-a { background:#2196F3; }
+        .badge-b { background:#FF9800; }
+        .badge-none { background:#ccc; }
+
+        .conf-bar {
+            display:inline-block; height:8px; border-radius:4px;
+            background:#4CAF50; vertical-align:middle;
+        }
+
+        .btn-play {
+            padding:5px 14px; border:1px solid #ddd; border-radius:4px;
+            background:#fff; cursor:pointer; font-size:0.85em;
+            transition:background 0.2s;
+        }
+        .btn-play:hover { background:#e3f2fd; }
+        .btn-play.playing { background:#e3f2fd; border-color:#2196F3; }
+
+        /* Loading */
+        .loading {
+            text-align:center; padding:40px; display:none;
+        }
+        .spinner {
+            display:inline-block; width:30px; height:30px;
+            border:3px solid #eee; border-top-color:#2196F3;
+            border-radius:50%; animation:spin 0.8s linear infinite;
+        }
+        @keyframes spin { to { transform:rotate(360deg); } }
+
+        .error { color:#e53935; text-align:center; padding:10px; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>Tajweedddd</h1>
+    <p class="subtitle">Deteksi Kesalahan Bacaan Tajwid</p>
+
+    <!-- Upload -->
+    <div class="upload-area" id="uploadArea">
+        <p>Klik atau seret file audio ke sini</p>
+        <p style="font-size:0.8em; color:#aaa; margin-top:5px;">Format: WAV, MP3</p>
+        <div class="filename" id="fileName"></div>
+        <input type="file" id="fileInput" accept="audio/*">
+    </div>
+
+    <div class="waveform-container" id="waveformContainer">
+        <canvas id="waveformCanvas"></canvas>
+        <audio id="audioPlayer" controls></audio>
+    </div>
+
+    <!-- Actions -->
+    <div class="actions">
+        <select id="methodSelect" style="padding:9px 12px; border:1px solid #ddd; border-radius:6px; font-size:0.9em; background:#fff;">
+            <option value="whisper">Whisper</option>
+            <option value="energy">Energy VAD</option>
+            <option value="sliding">Sliding Window</option>
+        </select>
+        <button class="btn btn-primary" id="btnAnalyze" disabled>Analisis Otomatis</button>
+        <button class="btn btn-secondary" id="btnClear" style="display:none;">Reset</button>
+    </div>
+
+    <!-- Loading -->
+    <div class="loading" id="loading">
+        <div class="spinner"></div>
+        <p style="margin-top:10px; color:#777;">Memproses audio...</p>
+    </div>
+
+    <!-- Error -->
+    <div class="error" id="errorMsg" style="display:none;"></div>
+
+    <!-- Results -->
+    <div class="results" id="results">
+        <h2>Hasil Analisis</h2>
+
+        <div class="summary" id="summary"></div>
+        <p id="methodInfo" style="text-align:center; color:#999; font-size:0.8em; margin-bottom:10px;"></p>
+
+        <table>
+            <thead>
+                <tr>
+                    <th>#</th>
+                    <th>Waktu</th>
+                    <th>Teks</th>
+                    <th>Durasi</th>
+                    <th>Play</th>
+                    <th>Model</th>
+                    <th>Hukum Tajwid</th>
+                    <th>Confidence</th>
+                </tr>
+            </thead>
+            <tbody id="segmentTable"></tbody>
+        </table>
+    </div>
+</div>
+
+<script>
+const uploadArea  = document.getElementById('uploadArea');
+const fileInput   = document.getElementById('fileInput');
+const fileName    = document.getElementById('fileName');
+const btnAnalyze  = document.getElementById('btnAnalyze');
+const btnClear    = document.getElementById('btnClear');
+const methodSel   = document.getElementById('methodSelect');
+const loading     = document.getElementById('loading');
+const errorMsg    = document.getElementById('errorMsg');
+const results     = document.getElementById('results');
+const summary     = document.getElementById('summary');
+const segTable    = document.getElementById('segmentTable');
+const waveformCon = document.getElementById('waveformContainer');
+const canvas      = document.getElementById('waveformCanvas');
+const audioPlayer = document.getElementById('audioPlayer');
+
+let currentFile = null;
+let audioCtx    = null;
+let audioBuffer = null;
+
+// Upload
+uploadArea.addEventListener('click', () => fileInput.click());
+
+uploadArea.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    uploadArea.classList.add('dragover');
+});
+
+uploadArea.addEventListener('dragleave', () => {
+    uploadArea.classList.remove('dragover');
+});
+
+uploadArea.addEventListener('drop', (e) => {
+    e.preventDefault();
+    uploadArea.classList.remove('dragover');
+    if (e.dataTransfer.files.length > 0) {
+        handleFile(e.dataTransfer.files[0]);
+    }
+});
+
+fileInput.addEventListener('change', () => {
+    if (fileInput.files.length > 0) {
+        handleFile(fileInput.files[0]);
+    }
+});
+
+function handleFile(file) {
+    currentFile = file;
+    fileName.textContent = file.name;
+    btnAnalyze.disabled = false;
+    btnClear.style.display = 'inline-block';
+
+    // Show audio player
+    const url = URL.createObjectURL(file);
+    audioPlayer.src = url;
+    waveformCon.style.display = 'block';
+
+    drawWaveform(file);
+
+    results.style.display = 'none';
+    errorMsg.style.display = 'none';
+}
+
+async function drawWaveform(file) {
+    if (!audioCtx) audioCtx = new AudioContext();
+    const buf = await file.arrayBuffer();
+    audioBuffer = await audioCtx.decodeAudioData(buf);
+    const data = audioBuffer.getChannelData(0);
+
+    const ctx = canvas.getContext('2d');
+    const dpr = window.devicePixelRatio || 1;
+    const w   = canvas.clientWidth;
+    const h   = canvas.clientHeight;
+    canvas.width  = w * dpr;
+    canvas.height = h * dpr;
+    ctx.scale(dpr, dpr);
+
+    ctx.fillStyle = '#fafafa';
+    ctx.fillRect(0, 0, w, h);
+
+    const step = Math.ceil(data.length / w);
+    ctx.strokeStyle = '#2196F3';
+    ctx.lineWidth   = 1;
+    ctx.beginPath();
+    for (let i = 0; i < w; i++) {
+        const idx = i * step;
+        let min = 1, max = -1;
+        for (let j = 0; j < step && idx + j < data.length; j++) {
+            const v = data[idx + j];
+            if (v < min) min = v;
+            if (v > max) max = v;
+        }
+        const yMin = (1 - max) * h / 2;
+        const yMax = (1 - min) * h / 2;
+        ctx.moveTo(i, yMin);
+        ctx.lineTo(i, yMax);
+    }
+    ctx.stroke();
+}
+
+
+btnAnalyze.addEventListener('click', async () => {
+    if (!currentFile) return;
+
+    loading.style.display = 'block';
+    results.style.display = 'none';
+    errorMsg.style.display = 'none';
+    btnAnalyze.disabled = true;
+
+    const formData = new FormData();
+    formData.append('audio', currentFile);
+    formData.append('method', methodSel.value);
+
+    try {
+        const resp = await fetch('/api/analyze', {
+            method: 'POST',
+            body: formData,
+        });
+        const data = await resp.json();
+
+        if (data.error) {
+            errorMsg.textContent = data.error;
+            errorMsg.style.display = 'block';
+        } else {
+            showResults(data);
+        }
+    } catch (err) {
+        errorMsg.textContent = 'Gagal menghubungi server: ' + err.message;
+        errorMsg.style.display = 'block';
+    } finally {
+        loading.style.display = 'none';
+        btnAnalyze.disabled = false;
+    }
+});
+
+function showResults(data) {
+    const modelACnt = data.segments.filter(s => s.model === 'A').length;
+    const modelBCnt = data.segments.filter(s => s.model === 'B').length;
+
+    summary.innerHTML = `
+        <div class="stat">
+            <div class="stat-value">${data.num_segments}</div>
+            <div class="stat-label">Total Segmen</div>
+        </div>
+        <div class="stat">
+            <div class="stat-value">${data.total_duration}s</div>
+            <div class="stat-label">Durasi Audio</div>
+        </div>
+        <div class="stat">
+            <div class="stat-value">${modelACnt}</div>
+            <div class="stat-label">Qalqalah / Mad</div>
+        </div>
+        <div class="stat">
+            <div class="stat-value">${modelBCnt}</div>
+            <div class="stat-label">Nun Sukun / Tanwin</div>
+        </div>
+    `;
+
+const mLabel = data.method === 'whisper' ? 'Whisper' :
+                   data.method === 'sliding' ? 'Sliding' : 'Energy VAD';    document.getElementById('methodInfo').textContent = 'Metode segmentasi: ' + mLabel;
+
+    segTable.innerHTML = '';
+    data.segments.forEach(seg => {
+        const badgeClass = seg.model === 'A' ? 'badge-a' :
+                           seg.model === 'B' ? 'badge-b' : 'badge-none';
+        const badgeText  = seg.model === 'A' ? 'Qalqalah/Mad' :
+                           seg.model === 'B' ? 'Nun/Tanwin' : '-';
+        const confWidth  = Math.max(seg.confidence, 0);
+        const textAr     = seg.text || '-';
+
+        segTable.innerHTML += `
+            <tr>
+                <td>${seg.index}</td>
+                <td>${seg.start}s — ${seg.end}s</td>
+                <td style="font-family:'Traditional Arabic','Amiri',serif; font-size:1.2em; direction:rtl;">${textAr}</td>
+                <td>${seg.duration}s</td>
+                <td><button class="btn-play" onclick="playSegment(this, '${seg.audio_b64}')">Play</button></td>
+                <td><span class="badge ${badgeClass}">${badgeText}</span></td>
+                <td><strong>${seg.label}</strong></td>
+                <td>
+                    <span class="conf-bar" style="width:${confWidth}px;"></span>
+                    ${seg.confidence}%
+                </td>
+            </tr>
+        `;
+    });
+
+    drawSegmentsOnWaveform(data.segments, data.total_duration);
+
+    results.style.display = 'block';
+}
+
+function drawSegmentsOnWaveform(segments, totalDuration) {
+    if (!audioBuffer) return;
+    const ctx = canvas.getContext('2d');
+    const dpr = window.devicePixelRatio || 1;
+    const w   = canvas.clientWidth;
+    const h   = canvas.clientHeight;
+
+    drawWaveform(currentFile).then(() => {
+        const ctx2 = canvas.getContext('2d');
+        segments.forEach(seg => {
+            const x1 = (seg.start / totalDuration) * w;
+            const x2 = (seg.end / totalDuration) * w;
+            const color = seg.model === 'A' ? 'rgba(33,150,243,0.15)' :
+                          seg.model === 'B' ? 'rgba(255,152,0,0.15)' :
+                                              'rgba(200,200,200,0.15)';
+            ctx2.fillStyle = color;
+            ctx2.fillRect(x1 * dpr, 0, (x2 - x1) * dpr, h * dpr);
+
+            ctx2.strokeStyle = seg.model === 'A' ? '#2196F3' :
+                               seg.model === 'B' ? '#FF9800' : '#ccc';
+            ctx2.lineWidth = 1;
+            ctx2.strokeRect(x1 * dpr, 0, (x2 - x1) * dpr, h * dpr);
+        });
+    });
+}
+
+
+let currentAudioSeg = null;
+
+function playSegment(btn, b64) {
+    if (currentAudioSeg) {
+        currentAudioSeg.pause();
+        document.querySelectorAll('.btn-play.playing').forEach(b => {
+            b.classList.remove('playing');
+            b.textContent = 'Play';
+        });
+    }
+
+    if (btn.classList.contains('playing')) {
+        currentAudioSeg = null;
+        return;
+    }
+
+    const audio = new Audio('data:audio/wav;base64,' + b64);
+    currentAudioSeg = audio;
+    btn.classList.add('playing');
+    btn.textContent = 'Stop';
+
+    audio.play();
+    audio.onended = () => {
+        btn.classList.remove('playing');
+        btn.textContent = 'Play';
+        currentAudioSeg = null;
+    };
+}
+
+
+btnClear.addEventListener('click', () => {
+    currentFile = null;
+    audioBuffer = null;
+    fileInput.value = '';
+    fileName.textContent = '';
+    btnAnalyze.disabled = true;
+    btnClear.style.display = 'none';
+    waveformCon.style.display = 'none';
+    results.style.display = 'none';
+    errorMsg.style.display = 'none';
+    audioPlayer.src = '';
+});
+</script>
+
+</body>
+</html>
